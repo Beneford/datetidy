@@ -1,0 +1,510 @@
+#!/bin/bash
+#
+# datetidy: utility to identify which files match a date policy
+#
+# Copyright(C) 2019 Beneford Limited
+#
+## Notes
+#	Each policy gives a time range, and indicates what files to match the policy
+#	Dates are those accepted by `date -d "Date"`
+#		The date is calculated using date -d "`date +'Date'`"
+#			you can use (eg) "%Y-%m-01 - 1 month"
+#				to give the first day of last month
+#	Definition of Policy
+#		sd - start date (default - a long time ago)
+#		ed - end date (default = today)
+#			the following are all compard with regular expressions
+#		moy - month of year
+#		dom - day of month
+#		dow - day of week (Mon,Tue,Wed,Thu,Fri,Sat,Sun)
+#		hour - hour of day
+#		minute - minute of hour
+#		group - year|month|day|hour - group by year, month, day, hour
+#		
+#	Examples - see --example
+
+# Implementation Notes
+#	array Policies contains the text version of an associative policy
+#	array Files is associative array indexed by filename, value is the file's timestamp
+
+# Function definitions follow
+iam=${0##*/}		# ${variable##*/} deletes upto last /
+			# ${variable%%:*} deletes from : to end
+
+dateCommand="date -Iseconds "
+Policies=()		# initialize Policies array
+declare -A Files	# initialize Files associative array
+
+# Usage: log levelL levelH lineno strings
+#	if level is greater than the current log-level, output strings to STDOUT
+log() { # usage: log level string
+#	debug "[debug: ($logLevel) $1 $2 $3 $4]"
+	if [ $logLevel -le $2 ] && [ $logLevel -ge $1 ]; then
+		if [ $logging == TRUE ]; then
+			if [ $logLineNos == TRUE ]; then
+				echo "[`date`][Line $3] ${@:4}" >> $logFile
+			else
+				echo "[`date`] ${@:4}" >> $logFile
+			fi
+		else
+			if [ $logLineNos == TRUE ]; then
+				echo [Line $3] "${@:4}" 1>&2
+			else
+				echo "${@:4}" 1>&2
+			fi
+		fi
+	fi
+	}
+
+usage() {
+	if [ "$usageShown" != "TRUE" ]; then
+	cat <<EOF
+Usage: $iam [options] filespec
+	Options:
+
+	--help		show this help screen
+	--examples	show some examples
+	--verbose	control message level (repeat for more information)
+	--quiet		control message level (repeat for less information)
+	--[no]match	return names of matching files (default: --match)
+	--[no]reversed	sort newest first (no=last) (default: --noreversed)
+	--[no]all	show all (with tag: selected, not selected, skipped)
+			   will not also process files, but will do -exec cmd
+	--policy ps	specify the policy string
+			   enclose in quotes if contains spaces or punctuation
+			   ps is a semi-colon delimited list of the following 
+			    sd:startDate  the start date (default = day0)
+			    ed:endDate    the end date (default = now)
+				Note: match when startDate <= fileDate < endDate
+				Note: give date as dd-mm-yyyy [hh[:mm[:ss]]]
+			   regular expressions compare:
+			    dow:Mon|Tue|...  day of week
+			    year:n	     year (4-digit)
+			    month:n	     month of year
+			    dom:n	     day of month
+			    hour:n	     hour (24hr clock)
+			    minute:n	     match minute
+			   how many to keep is set by:
+			    count:n	     how many to keep (default=0 ie all)
+						n<0 ie all-n
+			    group:y|m|w|d|h  group count by 
+				   year|month|week|day|hour
+			    mode:none|binary|linear counting scheme (default:none)
+				   none   - the match 'count' in each group
+				when combined with group, match 'count' in each
+				set of recent group intervals (default=day)
+				   binary - 1,2,4,8,...
+				   linear - 1,2,3,4,...
+			if no policy is specified, a default policy is used:
+			  sd		ie include everything
+	--[no]test	show keep or do commands, don't actually do them
+	--do cmd	run command on each of the files selected
+				if cmd contains {} the filename is substituted
+				if not, the filename will be appended
+	
+	short options use the initial letter of long options:
+		-hdvqpmrae	use (eg) -m- as short version of --nomatch
+
+EOF
+	usageShown=TRUE
+	fi
+	}
+
+examples() {
+	cat <<EOF
+$iam examples:
+
+#	Give all except the most recent 2
+$iam --policy "count=-2" *
+
+#	Give most recent 3 that are at least one month old
+$iam --reverse --policy "ed:now - 1 month;count=3" *
+
+#	Give oldest 3 that are at most than one month old
+$iam --policy "sd:now - 1 month;count=3" *
+
+#	Give all files created on Monday
+$iam --policy "doy:Mon" *
+
+#	Give all files created on 2nd of month
+$iam --policy "dom:2" *
+
+#	Give all files not created in 2018
+$iam --nomatch --policy "year=2018" *
+
+#	Give most recent 4 files up to end of 2018
+$iam --reverse --policy "ed=1Jan2019;count=4"
+
+#	Give all files except most recent 1 from each last 1 day, 2,4,8,16 days
+$iam --reverse --policy "group=day;count=-5;mode=binary"
+
+#	Give all files except in last week and 
+#	   most recent 1 from each last 1 day, 2,4,8,16,32,64,128,256,512 days
+$iam --reverse --policy "ed=now - 7 days;group=day;count=-10;mode=binary"
+
+EOF
+	usageShown=TRUE
+}
+
+decodeDate() {
+	log 3 9 $LINENO "Processing date: $@"
+	case "${@,,}" in
+		"now")			$dateCommand;;
+		"day0"|"day zero") 	$dateCommand --date="@0";;
+		*)			$dateCommand --date="`date +\"$@\"`";;
+	esac
+}
+
+addPolicy() {
+	declare -A aPolicy
+	aPolicy[ed]=$(decodeDate now)
+	aPolicy[sd]=$(decodeDate day0)
+	aPolicy[count]=0
+	aPolicy[mode]=n
+	
+	IFS=';'
+	ps=($@)
+	unset IFS
+	for p in "${ps[@]}"; do
+		IFS='='
+		pi=($p)
+		unset IFS
+		case ${pi[0]} in
+			sd) 
+				aPolicy[sd]=$(decodeDate "${pi[1]}")
+				;;
+			ed)
+				aPolicy[ed]=$(decodeDate "${pi[1]}")
+				;;
+			dow)
+				case ${pi[1],,} in
+					mon|monday)		aPolicy[dow]=Mon;;
+					tue|tues|tuesday)	aPolicy[dow]=Tue;;
+					wed|weds|wednesday)	aPolicy[dow]=Wed;;
+					thu|thur|thursday)	aPolicy[dow]=Thu;;
+					fri|friday)		aPolicy[dow]=Fri;;
+					sat|saturday)		aPolicy[dow]=Sat;;
+					sun|sunday)		aPolicy[dow]=Sun;;
+					*)			log 1 9 $LINENO ${pi[1]} is an invalid day of week;;
+				esac
+				;;
+			year)		aPolicy[year]=1;   [[ ${pi[1]} =~ ^[0-9]+ ]] && aPolicy[year]=${pi[1]};;
+			moy|mon|month)	aPolicy[moy]=1;    [[ ${pi[1]} =~ ^[0-9]+ ]] && aPolicy[moy]=${pi[1]};;
+			dom)		aPolicy[dom]=1;    [[ ${pi[1]} =~ ^[0-9]+ ]] && aPolicy[dom]=${pi[1]};;
+			hour)		aPolicy[hour]=0;   [[ ${pi[1]} =~ ^[0-9]+ ]] && aPolicy[hour]=${pi[1]};;
+			min|minute)	aPolicy[minute]=0; [[ ${pi[1]} =~ ^[0-9]+ ]] && aPolicy[minute]=${pi[1]};;
+			count)		aPolicy[count]=-1; [[ ${pi[1]} =~ ^-*[0-9]+ ]] && aPolicy[count]=${pi[1]};;
+			group)
+				case ${pi[1],,} in
+					y|yr|year)		aPolicy[group]=Year;;
+					m|mon|month)		aPolicy[group]=Month;;
+					w|we|wee|week)		aPolicy[group]=Week;;
+					d|dy|day)		aPolicy[group]=Day;;
+					d|dy|day)		aPolicy[group]=Day;;
+					h|hr|hour)		aPolicy[group]=Hour;;
+					*)			log 1 9 $LINENO ${pi[1]} is an invalid group;;
+				esac
+				;;
+			mode)	
+				case ${pi[1],,} in
+					n|no|non|none)			aPolicy[mode]=n;;
+					b|bi|bin|bina|binar|binary)	aPolicy[mode]=b;;
+					l|li|lin|line|linea|linear)	aPolicy[mode]=l;;
+					*)				log 1 9 $LINENO ${pi[1]} is an invalid mode;;
+				esac
+				;;
+			
+			*)  log 1 9 $LINENO unknown option: ${pi[0]}
+		esac
+	done
+	if [ ${aPolicy[mode]} == n ]; then
+		Policies+=("$(typeset -p aPolicy)")
+	else
+		# when policy has a mode, we need to transform into a sequence of policies
+		#	n <-- 1
+		#	[ed] --> [ed] - n group;
+		n=1				# Increment (affected by the mode setting)
+		group=${aPolicy[group]}
+		[ "$group" == "" ] && group=Day	# set a default group
+		mode=${aPolicy[mode]}
+		i=${aPolicy[count]}	# Counter
+		if [ ${aPolicy[count]} -lt 0 ]; then
+			i=$(( -$i ))
+			aPolicy[count]=-1	# set the count to -1 for each generated policy
+		else
+			aPolicy[count]=1	# set the count to 1 for each generated policy
+		fi
+		unset aPolicy[group]		# we don't want group or mode in the generated policy
+		unset aPolicy[mode]
+		while [ $i -gt 0 ]; do
+			# Adjust the end date (to keep going back in time
+			aPolicy[sd]=$(decodeDate "${aPolicy[ed]} - $n $group")
+			Policies+=("$(typeset -p aPolicy)")
+			aPolicy[ed]=${aPolicy[sd]}
+			[ $mode == b ] && n=$(( n * 2 ))
+			[ $mode == l ] && n=$(( n + 1 ))
+			i=$(( $i - 1 ))
+		done
+	fi
+	if [ $logLevel -gt 2 ]; then
+		policy=${Policies:-1}
+		log 3 9 $LINENO "Policy: ${policy#*=}"
+	fi
+}
+
+addFiles() {
+	log 3 9 $LINENO "adding file: $@"
+	for file in "$@"; do
+		Files["$file"]=$($dateCommand -r "$file")
+	done
+}
+
+processOption() {
+	param=$1
+	TorF=TRUE
+	[[ $param =~ --no* ]] && TorF=FALSE && param=--${param:4}
+	[[ $param =~ -[amr]- ]] && TorF=FALSE && param=-${param:1:1}
+	[[ $param =~ -[amr]\+ ]] && TorF=TRUE && param=-${param:1:1}	# escape + or it means 1 or more
+	log 3 9 $LINENO "Processing option: $param ($TorF)"
+	case $paramFor in
+		None) case $param in
+			-h|--h|--he|--hel|--help)
+				usage;;
+			-e|--e|--ex|--exa|--exam|--examp|--exampl|--example|--examples)
+				examples;;
+			-v|--v|--ve|--verb-|--verbo|--verbos|--verbose)
+				logLevel=$(( $logLevel+1 ));;
+			-q|--q|--qu|--qui|--quie|--quiet)
+				[ $logLevel -gt 0 ] && logLevel=$(( $logLevel-1 ));;
+			-p|--p|--po|--pol|--poli|--polic|--policy)
+				paramFor=Policy;;
+			-m|--m|--ma|--mat|--matc|--match)
+				matching=$TorF;;
+			-a|--a|--al|--all)
+				showAll=$TorF;;
+			-r|--r|--re|--rev|--reve|--rever|--revers|--reverse|--reversed)
+				reversed=$TorF;;
+			-d|--d|--do)
+				paramFor=Cmd; givenCmd=TRUE;;
+			-t|--t|-te|--tes|--test)
+				ActionTest=$TorF;;
+			--*)	echo "Invalid long option: $1";;
+			-*)	echo "Invalid option: $1";;
+			*)	addFiles "$1";;
+			esac;;
+		Policy)	addPolicy "$1"; paramFor=None;;
+		Cmd)	cmd="$1"; paramFor=None;;
+	esac
+}
+
+processOptions() {
+	paramFor=None
+	for arg in "$@"; do
+		if [[ $arg =~ ^-[^-].* ]]; then
+			for i in $(seq 2 ${#arg}); do
+				if [[ ${arg:$i:1} =~ [+-] ]]; then
+					processOption "-${arg:$i-1:2}"	# include a following -
+				else
+					[[ ${arg:$i-1:1} =~ [+-] ]] || processOption "-${arg:$i-1:1}" # Don't process --
+				fi
+			done
+		else
+			processOption "$arg"
+		fi
+	done
+}
+
+# Usage: debug strings
+#	output strings to STDERR
+debug() { # usage: debug string (output to stderr)
+	echo "${@:1}" 1>&2
+	}
+
+# Set defaults (can be overriden by the config file
+defaults() {
+	logging=FALSE
+	logLineNos=FALSE
+	matching=TRUE
+	reversed=FALSE
+	showAll=FALSE
+	givenCmd=FALSE
+	logLevel=1
+	cmd=echo
+	ActionTest=FALSE
+	}
+
+# output the current configuration
+printConfig() {
+	cat <<EOF
+Active configuration:
+logLevel=$logLevel;
+reversed=$reversed;
+matching=$matching
+showAll=$showAll
+cmd=$cmd
+EOF
+	}
+
+# Usage do cmd
+#	Execute a command - with support for testMode and log 1
+doNow() {
+	if [ $testMode != FALSE ]; then
+		echo $@
+	else
+		log 2 9 $LINENO $@
+		eval $@
+	fi
+	}
+
+# This is the main program
+
+usageShown=FALSE
+
+[ "$1" == "" ] && usage
+
+defaults
+processOptions "$@"
+
+[ $usageShown == TRUE ] && exit
+
+[[ $cmd =~ \{\} ]] || cmd="$cmd \"{}\""
+
+log 2 9 $LINENO "$iam started `date`"
+
+[ $logLevel -gt 2 ] && printConfig
+
+# We now have the policies as ${Policies[i]} and the files as ${!Files[i]} file times are ${Files[$file]}
+# Proceed by:
+#	For each policy, check every file 
+#		if file meets the Date range, remove from Files()
+#			if file matches other policy criteria add to Match()
+#			else add to noMatch()
+#	Then choose the files to keep/lose
+if [ $logLevel -gt 2 ]; then
+	for file in "${!Files[@]}"; do
+		log 2 9 $LINENO "	File: $file [${Files[$file]}]"
+	done
+fi
+
+[ ${#Policies[@]} == 0 ] && addPolicy ""
+
+for policy in "${Policies[@]}"; do
+	matchfiles=()
+	log 2 9 $LINENO "Processing policy: ${policy#*=}"
+	eval $policy
+	declare -A Match
+	declare -A noMatch
+	for file in "${!Files[@]}"; do
+		isMatch=TRUE		# Match is true unless some condition makes it false
+		log 3 9 $LINENO "Checking $file - ${Files[$file]}"
+		if ( [ "${aPolicy[sd]}" \< "${Files[$file]}" ] && [ "${Files[$file]}" \< "${aPolicy[ed]}" ] ) || [ "${Files[$file]}" == "${aPolicy[ed]}" ]; then
+			log 3 9 $LINENO "$file matches policy date range"
+			if [ ! "${aPolicy[year]}" == "" ]; then
+				year=`date +%Y --date="${Files["$file"]}"`
+				log 3 9 $LINENO "$file has year:$year ~ ${aPolicy[year]}"
+				[[ $year =~ ${aPolicy[year]} ]] || isMatch=FALSE
+			fi
+			if [ ! "${aPolicy[moy]}" == "" ]; then
+				moy=`date +%m --date="${Files["$file"]}"`
+				log 3 9 $LINENO "$file has moy:$moy ~ ${aPolicy[moy]}"
+				[[ $moy =~ ${aPolicy[moy]} ]] || isMatch=FALSE
+			fi
+			if [ ! "${aPolicy[dom]}" == "" ]; then
+				dom=`date +%d --date="${Files["$file"]}"`
+				log 3 9 $LINENO "$file has dom:$dom ~ ${aPolicy[dom]}"
+				[[ $dom =~ ${aPolicy[dom]} ]] || isMatch=FALSE
+			fi
+			if [ ! "${aPolicy[hour]}" == "" ]; then
+				hour=`date +%H --date="${Files["$file"]}"`
+				log 3 9 $LINENO "$file has hour:$hour ~ ${aPolicy[hour]}"
+				[[ $hour =~ ${aPolicy[hour]} ]] || isMatch=FALSE
+			fi
+			if [ ! "${aPolicy[minute]}" == "" ]; then
+				minute=`date +%M --date="${Files["$file"]}"`
+				log 3 9 $LINENO "$file has minute:$minute ~ ${aPolicy[minute]}"
+				[[ $minute =~ ${aPolicy[minute]} ]] || isMatch=FALSE
+			fi
+			if [ ! "${aPolicy[dow]}" == "" ]; then
+				dow=`date +%a --date="${Files["$file"]}"`
+				log 3 9 $LINENO "$file has dow:$dow ~ ${aPolicy[dow]}"
+				[[ $dow =~ ${aPolicy[dow]} ]] || isMatch=FALSE
+			fi
+			if [ $isMatch == $matching ]; then
+				log 2 9 $LINENO "$file - ${Files[$file]} selected"
+				Match[$file]=${Files["$file"]}
+			else
+				if [ $showAll == TRUE ]; then
+					echo "$file not selected"
+				else
+					log 2 9 $LINENO "$file - ${Files[$file]} not selected"
+				fi
+				noMatch[$file]=${Files["$file"]}
+			fi	
+			unset Files["$file"]
+		else
+			log 3 9 $LINENO "$file does not match policy date range"
+		fi
+	done
+	if [ $reversed == TRUE ]; then
+		sortReverse=-r
+	else
+		sortReverse=
+	fi
+	IFS=$'\n'
+	Sorted=(`for file in "${!Match[@]}"; do
+		echo ${Match[$file]} $file
+		done | sort $sortReverse | sed -e "s/[^ ]* *//"`)
+	unset IFS
+	
+	i=0
+	lastGroupValue=""
+	policyCount=${aPolicy[count]}
+	log 2 9 $LINENO "Counting: $policyCount/${#Match[@]}"
+	if [ $policyCount -le 0 ]; then
+		policyCount=$(( ${#Match[@]} + $policyCount ))
+	fi
+	log 2 9 $LINENO "Counting: $policyCount/${#Match[@]}"
+	for file in "${Sorted[@]}"; do
+		groupValue=${Match[$file]}
+		log 3 9 $LINENO $file group ${aPolicy[group]}: $lastGroupValue --\> $groupValue
+		case ${aPolicy[group]} in
+			Year)	groupValue=${groupValue:0:4};;
+			Month)	groupValue=${groupValue:5:2};;
+			Day)	groupValue=${groupValue:8:2};;
+			Hour)	groupValue=${groupValue:11:2};;
+			*)	groupValue=$lastGroupValue;;
+		esac
+		log 3 9 $LINENO Group ${aPolicy[group]}: $lastGroupValue --\> $groupValue
+		# If group value has changed, reset the counter
+		[ "$lastGroupValue" == "$groupValue" ] || i=0
+		lastGroupValue=$groupValue
+		if [ $i -lt $policyCount ]; then
+			if [ $showAll == TRUE ]; then
+				echo "$file selected"
+			fi
+			if [ $showAll == FALSE ] || [ $givenCmd == TRUE ]; then
+				action=${cmd//\{\}/$file}
+				if [ $ActionTest == TRUE ]; then
+					echo $action
+				else
+					eval $action
+				fi
+			fi
+			i=$(( $i + 1 ))
+		else
+			[ $showAll == TRUE ] && echo "$file not selected (count)"
+		fi
+	done
+	unset Match
+	unset noMatch
+done
+
+# After checking all date ranges, add any files not yet matched - and report if requested
+if [ $showAll == TRUE ]; then
+	for file in "${!Files[@]}"; do
+		echo "$file not selected (no policy)"
+	done
+fi
+
+log 2 9 $LINENO "$iam completed `date`"
+exit
